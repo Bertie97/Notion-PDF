@@ -15,6 +15,8 @@ from .blocks import render_block, render_database
 from .utils import plain_text_from_rich, property_value_to_html
 
 LOGGER = logging.getLogger(__name__)
+PREVIEW_TOP_OFFSET_PX = 15
+PREVIEW_ROW_OVERFLOW_TOLERANCE_PX = 10
 
 A4_W_MM = 210.0
 A4_H_MM = 297.0
@@ -29,7 +31,7 @@ class PageRenderer:
         full_width: bool | None = None,
         view_type: str = "auto",
         group_by: str | None = None,
-        gallery_fit: bool = False,
+        gallery_fit: bool | str = False,
         gallery_size: str = "medium",
         margin_mm: float = 15.0,
         page_size: str = "A4",
@@ -45,6 +47,7 @@ class PageRenderer:
         self.margin_mm = margin_mm
         self.page_size = page_size
         self.database_options = database_options or {}
+        self._foreground_mask_cache: dict[str, str] = {}
 
     def fetch_page_data(
         self,
@@ -111,7 +114,10 @@ class PageRenderer:
 
     def _enrich_databases(self, blocks: list[dict]) -> list[dict]:
         """Pre-fetch database schema, entries and entry blocks for child_database blocks."""
-        db_blocks = [b for b in blocks if b.get("type") == "child_database"]
+        db_blocks = [
+            b for b in blocks
+            if b.get("type") == "child_database" and b.get("_db") is None
+        ]
         LOGGER.info("Found %d child_database block(s) to enrich", len(db_blocks))
 
         def fetch_db(block: dict) -> tuple[dict | None, list[dict]]:
@@ -148,7 +154,7 @@ class PageRenderer:
         full_width: bool | None = None,
         view_type: str | None = None,
         group_by: str | None = None,
-        gallery_fit: bool | None = None,
+        gallery_fit: bool | str | None = None,
         gallery_size: str | None = None,
         database_options: dict[str, dict] | None = None,
         preview_mode: bool = False,
@@ -174,7 +180,7 @@ class PageRenderer:
         full_width: bool | None = None,
         view_type: str | None = None,
         group_by: str | None = None,
-        gallery_fit: bool | None = None,
+        gallery_fit: bool | str | None = None,
         gallery_size: str | None = None,
         database_options: dict[str, dict] | None = None,
         preview_mode: bool = False,
@@ -312,28 +318,47 @@ class PageRenderer:
                 # Pre-fetch entry blocks for gallery cover fallbacks and heuristics.
                 self._ensure_entry_blocks_cache(entries, sample_size=10)
                 db_options = self.database_options.get(db_id, {})
-                selected_view = self._selected_view(db, db_options.get("view_id"))
+                selected_view = self._selected_view(
+                    db, db_options.get("view_id") or db.get("_requested_view_id")
+                )
                 view_type = db_options.get("view_type") or (
                     selected_view.get("type") if selected_view else self._resolve_view_type(db, entries)
                 )
                 if view_type not in ("table", "gallery", "list"):
                     view_type = "table"
+                if view_type == "gallery" and self.client is not None:
+                    # Gallery cards may use the first image block as a cover;
+                    # load all entries instead of limiting fallback covers to the heuristic sample.
+                    self._ensure_entry_blocks_cache(entries, sample_size=len(entries))
                 requested_group = db_options.get("group_by")
-                group_by = requested_group or None
+                if requested_group == "__follow_view__" or "group_by" not in db_options:
+                    group_by = self._view_group_property(db, selected_view)
+                else:
+                    group_by = requested_group or None
                 requested_size = db_options.get("gallery_size")
-                gallery_size = requested_size or self._view_gallery_size(selected_view) or self.gallery_size
+                gallery_size = (
+                    self._view_gallery_size(selected_view) or self.gallery_size
+                    if requested_size == "__follow_view__" or "gallery_size" not in db_options
+                    else requested_size or self.gallery_size
+                )
                 requested_fit = db_options.get("gallery_fit")
                 gallery_fit = (
                     self._view_gallery_fit(selected_view)
-                    if requested_fit is None else requested_fit
+                    if requested_fit == "__follow_view__" or "gallery_fit" not in db_options
+                    else requested_fit
                 )
                 ctx = {
                     "client": self.client,
                     "entry_blocks_cache": getattr(self, "_entry_blocks_cache", {}),
+                    "foreground_mask_cache": self._foreground_mask_cache,
                     "group_by": group_by,
                     "gallery_fit": self.gallery_fit if gallery_fit is None else gallery_fit,
                     "gallery_size": gallery_size,
                     "view": selected_view,
+                    "database_title": block.get("child_database", {}).get("title") or db.get("name") or "数据库",
+                    "show_title": db_options.get("show_title", not block.get("_root_database", False)),
+                    "sort_mode": (db_options.get("sort") or ("view", None))[0],
+                    "sort_property": (db_options.get("sort") or ("view", None))[1],
                 }
                 try:
                     parts.append(render_database(db, entries, view_type, ctx))
@@ -412,7 +437,11 @@ class PageRenderer:
     def _selected_view(db: dict, view_id: str | None) -> dict | None:
         views = db.get("_views", [])
         if view_id:
-            return next((view for view in views if view.get("id") == view_id), None)
+            normalized = view_id.replace("-", "").lower()
+            return next((
+                view for view in views
+                if str(view.get("id", "")).replace("-", "").lower() == normalized
+            ), None)
         return views[0] if views else None
 
     @staticmethod
@@ -475,6 +504,8 @@ class PageRenderer:
 {body}
   </main>
 </div>
+{self._adaptive_gallery_script()}
+{self._table_layout_script()}
 {self._rotation_script(orientation)}
 {pagination_script}
 </body>
@@ -512,6 +543,8 @@ class PageRenderer:
             margin-bottom: 1.2em;
             border-bottom: 1px solid #eee;
             padding-bottom: 0.6em;
+            break-after: avoid-page;
+            page-break-after: avoid;
         }}
         .nb-page-title-line {{
             display: flex;
@@ -574,6 +607,8 @@ class PageRenderer:
             margin: 1.2em 0 0.5em;
             line-height: 1.25;
             font-weight: 600;
+            break-after: avoid-page;
+            page-break-after: avoid;
         }}
         h1.nb-heading_1 {{ font-size: 17pt; }}
         h2.nb-heading_2 {{ font-size: 14pt; }}
@@ -688,6 +723,13 @@ class PageRenderer:
         .nb-db {{
             margin: 1em 0;
         }}
+        .nb-db-title {{
+            font-size: 14pt;
+            font-weight: 650;
+            margin: 1em 0 0.45em;
+            break-after: avoid-page;
+            page-break-after: avoid;
+        }}
         .nb-db-gallery {{
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(70mm, 1fr));
@@ -738,6 +780,23 @@ class PageRenderer:
         .nb-db-gallery-cover-fit img {{
             object-fit: contain;
         }}
+        .nb-db-gallery-cover-fit-top img {{
+            object-fit: cover;
+            object-position: top center;
+        }}
+        .nb-db-gallery-cover-fit-auto img {{
+            object-fit: cover;
+            object-position: 50% 50%;
+        }}
+        .nb-adaptive-mask {{
+            display: none;
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }}
+        body.show-adaptive-mask .nb-adaptive-mask {{ display: block; }}
         .nb-db-gallery-cover-empty {{
             background: linear-gradient(135deg, hsl(var(--cover-hue, 200), 55%, 92%), hsl(var(--cover-hue, 200), 45%, 85%));
             display: flex;
@@ -903,13 +962,174 @@ class PageRenderer:
         }}
         """
 
+    @staticmethod
+    def _adaptive_gallery_script() -> str:
+        """Set a cover crop's focal point from a lightweight image saliency map."""
+        return r"""
+        <script>
+        (function() {
+            function positionImage(img) {
+                var frame = img.parentElement;
+                if (!frame || !img.naturalWidth || !img.naturalHeight) return;
+                if (img.dataset.foregroundMask && !img._foregroundMask) {
+                    if (img._foregroundMaskLoading) return;
+                    img._foregroundMaskLoading = true;
+                    var maskImage = new Image();
+                    maskImage.onload = function() { img._foregroundMask = maskImage; positionImage(img); };
+                    maskImage.src = img.dataset.foregroundMask;
+                    return;
+                }
+                var canvas = document.createElement('canvas'), size = 64;
+                canvas.width = canvas.height = size;
+                var ctx = canvas.getContext('2d', { willReadFrequently: true });
+                var fx = 0.5, fy = 0.5, sx0 = 0, sy0 = 0, sx1 = 1, sy1 = 1, subjectDetected = false;
+                try {
+                    var analysisImage = img._foregroundMask || img;
+                    ctx.drawImage(analysisImage, 0, 0, size, size);
+                    var pixels = ctx.getImageData(0, 0, size, size).data;
+                    var sum = 0, sx = 0, sy = 0, maxWeight = 0, samples = [];
+                    for (var y = 1; y < size - 1; y++) for (var x = 1; x < size - 1; x++) {
+                        var i = (y * size + x) * 4, l = 0.299 * pixels[i] + 0.587 * pixels[i+1] + 0.114 * pixels[i+2];
+                        var il = (y * size + x - 1) * 4, ir = (y * size + x + 1) * 4;
+                        var iu = ((y - 1) * size + x) * 4, id = ((y + 1) * size + x) * 4;
+                        var dx = l - (0.299 * pixels[il] + 0.587 * pixels[il+1] + 0.114 * pixels[il+2]);
+                        var dy = l - (0.299 * pixels[iu] + 0.587 * pixels[iu+1] + 0.114 * pixels[iu+2]);
+                        var contrast = Math.abs(dx) + Math.abs(dy);
+                        var saturation = Math.max(pixels[i], pixels[i+1], pixels[i+2]) - Math.min(pixels[i], pixels[i+1], pixels[i+2]);
+                        // U2NetP's only-mask PNG is grayscale (foreground in R),
+                        // not an alpha mask; use luminance directly for its pixels.
+                        var weight = img._foregroundMask ? pixels[i] : contrast + saturation * 0.35;
+                        samples.push({ x: x, y: y, weight: weight }); maxWeight = Math.max(maxWeight, weight);
+                        sum += weight; sx += x * weight; sy += y * weight;
+                    }
+                    if (sum > 0) {
+                        fx = sx / sum / (size - 1); fy = sy / sum / (size - 1);
+                        var bx0 = size, by0 = size, bx1 = 0, by1 = 0, found = false;
+                        samples.forEach(function(sample) {
+                            if (sample.weight >= maxWeight * 0.35) {
+                                bx0 = Math.min(bx0, sample.x); by0 = Math.min(by0, sample.y);
+                                bx1 = Math.max(bx1, sample.x); by1 = Math.max(by1, sample.y); found = true;
+                            }
+                        });
+                        if (found) { sx0 = bx0 / (size - 1); sy0 = by0 / (size - 1); sx1 = bx1 / (size - 1); sy1 = by1 / (size - 1); subjectDetected = true; }
+                    }
+                } catch (e) { /* Cross-origin images fall back to center. */ }
+                var scale = Math.max(frame.clientWidth / img.naturalWidth, frame.clientHeight / img.naturalHeight);
+                var renderedW = img.naturalWidth * scale, renderedH = img.naturalHeight * scale;
+                var overflowX = Math.max(0, renderedW - frame.clientWidth), overflowY = Math.max(0, renderedH - frame.clientHeight);
+                function cropPosition(start, end, focal, rendered, viewport, overflow) {
+                    if (!overflow) return 0;
+                    if (!subjectDetected) return overflow / 2;
+                    var subjectStart = start * rendered, subjectEnd = end * rendered;
+                    var subjectSize = subjectEnd - subjectStart;
+                    if (subjectSize <= viewport) {
+                        // Keep the whole subject visible and use remaining pixels as equal margins.
+                        var minCrop = Math.max(0, subjectEnd - viewport), maxCrop = Math.min(overflow, subjectStart);
+                        return (minCrop + maxCrop) / 2;
+                    }
+                    // The subject is wider than the viewport. Preserve the side with the thinner
+                    // salient mass and crop from the heavier side.
+                    var leftMass = Math.max(0, focal - start), rightMass = Math.max(0, end - focal);
+                    return leftMass >= rightMass
+                        ? Math.max(0, Math.min(overflow, subjectEnd - viewport))
+                        : Math.max(0, Math.min(overflow, subjectStart));
+                }
+                var cropX = cropPosition(sx0, sx1, fx, renderedW, frame.clientWidth, overflowX);
+                var cropY = cropPosition(sy0, sy1, fy, renderedH, frame.clientHeight, overflowY);
+                var px = overflowX ? cropX / overflowX * 100 : 50;
+                var py = overflowY ? cropY / overflowY * 100 : 50;
+                img.style.objectPosition = px.toFixed(2) + '% ' + py.toFixed(2) + '%';
+                var mask = frame.querySelector('.nb-adaptive-mask');
+                if (!mask && subjectDetected) {
+                    mask = document.createElement('canvas'); mask.className = 'nb-adaptive-mask'; frame.appendChild(mask);
+                }
+                if (mask && subjectDetected) {
+                    mask.width = Math.max(1, frame.clientWidth); mask.height = Math.max(1, frame.clientHeight);
+                    var maskCtx = mask.getContext('2d'); maskCtx.clearRect(0, 0, mask.width, mask.height);
+                    var threshold = img._foregroundMask ? 32 : maxWeight * 0.35;
+                    var cellW = renderedW / (size - 1), cellH = renderedH / (size - 1);
+                    samples.forEach(function(sample) {
+                        if (sample.weight < threshold) return;
+                        var left = sample.x / (size - 1) * renderedW - cropX;
+                        var top = sample.y / (size - 1) * renderedH - cropY;
+                        var right = Math.min(frame.clientWidth, left + cellW), bottom = Math.min(frame.clientHeight, top + cellH);
+                        left = Math.max(0, left); top = Math.max(0, top);
+                        if (right > left && bottom > top) {
+                            var alpha = img._foregroundMask
+                                ? Math.min(0.72, 0.10 + sample.weight / 255 * 0.62)
+                                : Math.min(0.65, 0.14 + sample.weight / Math.max(1, maxWeight) * 0.5);
+                            maskCtx.fillStyle = 'rgba(255, 174, 0,' + alpha.toFixed(2) + ')';
+                            maskCtx.fillRect(left, top, right - left, bottom - top);
+                        }
+                    });
+                }
+            }
+            function apply() {
+                document.querySelectorAll('.nb-db-gallery-cover-fit-auto img').forEach(function(img) {
+                    if (img.complete) positionImage(img); else img.addEventListener('load', function() { positionImage(img); }, { once: true });
+                });
+            }
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', apply); else apply();
+        })();
+        </script>
+        """
+
+    @staticmethod
+    def _table_layout_script() -> str:
+        return r"""
+        <script>
+        (function() {
+            function optimize(table) {
+                var rows = Array.prototype.slice.call(table.rows), count = rows[0] ? rows[0].cells.length : 0;
+                if (!count) return;
+                table.style.width = '100%'; table.style.maxWidth = '100%'; table.style.tableLayout = 'fixed';
+                var group = table.querySelector('colgroup');
+                if (!group) { group = document.createElement('colgroup'); table.insertBefore(group, table.firstChild); }
+                group.innerHTML = '';
+                for (var i = 0; i < count; i++) { var col = document.createElement('col'); col.style.width = (100 / count) + '%'; group.appendChild(col); }
+                function lineCounts() {
+                    return Array.from({length: count}, function(_, col) {
+                        return Math.max.apply(null, rows.map(function(row) {
+                            var cell = row.cells[col]; if (!cell) return 1;
+                            // A table row synchronizes all cell heights, so measure a clone
+                            // outside the table to obtain this cell's intrinsic wrapped height.
+                            var clone = cell.cloneNode(true), style = getComputedStyle(cell);
+                            clone.style.cssText = 'position:absolute;visibility:hidden;display:block;box-sizing:border-box;' +
+                                'width:' + Math.max(8, cell.clientWidth) + 'px;height:auto;max-height:none;' +
+                                'min-height:0;white-space:' + style.whiteSpace + ';font:' + style.font + ';' +
+                                'line-height:' + style.lineHeight + ';padding:' + style.padding + ';';
+                            document.body.appendChild(clone);
+                            var lh = parseFloat(style.lineHeight) || 14, height = clone.scrollHeight;
+                            clone.remove();
+                            return Math.max(1, Math.round(height / lh));
+                        }));
+                    });
+                }
+                for (var pass = 0; pass < 20; pass++) {
+                    var counts = lineCounts(), ordered = counts.slice().sort(function(a,b) { return a-b; });
+                    var median = ordered[Math.floor(ordered.length / 2)], max = Math.max.apply(null, counts);
+                    if (max <= median) break;
+                    var widths = Array.prototype.map.call(group.children, function(col) { return parseFloat(col.style.width) || (100 / count); });
+                    var donor = counts.indexOf(Math.min.apply(null, counts)), target = counts.indexOf(max);
+                    if (donor === target || widths[donor] <= 5) break;
+                    var transfer = Math.min(3, widths[donor] - 5);
+                    widths[donor] -= transfer; widths[target] += transfer;
+                    widths.forEach(function(width, i) { group.children[i].style.width = width + '%'; });
+                }
+            }
+            function apply() { document.querySelectorAll('.nb-db-table .nb-table').forEach(optimize); }
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', apply); else apply();
+        })();
+        </script>
+        """
+
     def _preview_css(self, orientation: str) -> str:
         page_width = A4_W_MM if orientation == "portrait" else A4_H_MM
         page_height = A4_H_MM if orientation == "portrait" else A4_W_MM
         return f"""
         body.preview-mode {{
             background-color: #e5e5ea;
-            padding: 10px 0;
+            padding: 0;
         }}
         body.preview-mode .nb-page {{
             max-width: none;
@@ -924,7 +1144,7 @@ class PageRenderer:
         .preview-page {{
             width: {page_width}mm;
             height: {page_height}mm;
-            padding: {self.margin_mm}mm;
+            padding: calc({self.margin_mm}mm - {PREVIEW_TOP_OFFSET_PX}px) {self.margin_mm}mm {self.margin_mm}mm;
             background: #fff;
             box-shadow: 0 2px 10px rgba(0,0,0,0.12);
             box-sizing: border-box;
@@ -944,11 +1164,38 @@ class PageRenderer:
             max-height: {max(20.0, page_height - 2 * self.margin_mm - 12)}mm;
             object-fit: contain;
         }}
+        @media print {{
+            @page {{
+                size: A4 {orientation};
+                margin: 0;
+            }}
+            html, body.preview-mode {{
+                width: {page_width}mm;
+                margin: 0;
+                background: #fff;
+            }}
+            .preview-pages {{
+                display: block;
+            }}
+            .preview-page {{
+                width: {page_width}mm;
+                height: {page_height}mm;
+                margin: 0;
+                box-shadow: none;
+                break-after: page;
+                page-break-after: always;
+            }}
+            .preview-page:last-child {{
+                break-after: auto;
+                page-break-after: auto;
+            }}
+        }}
         """
 
     def _preview_pagination_script(self, orientation: str) -> str:
         page_width = A4_W_MM if orientation == "portrait" else A4_H_MM
         page_height = A4_H_MM if orientation == "portrait" else A4_W_MM
+        content_width = page_width - 2 * self.margin_mm
         return f"""
         <script>
         (function() {{
@@ -966,6 +1213,20 @@ class PageRenderer:
 
                     var pagesContainer = document.createElement('div');
                     pagesContainer.className = 'preview-pages';
+                    Array.prototype.forEach.call(content.querySelectorAll('.nb-db-gallery'), function(gallery) {{
+                        var rows = [], rowTop = null;
+                        var originalWidth = gallery.style.width;
+                        gallery.style.width = '{content_width}mm';
+                        Array.prototype.forEach.call(gallery.children, function(card) {{
+                            var top = card.getBoundingClientRect().top;
+                            if (rowTop === null || Math.abs(top - rowTop) > 1) {{
+                                rows.push([]); rowTop = top;
+                            }}
+                            rows[rows.length - 1].push(card);
+                        }});
+                        gallery.style.width = originalWidth;
+                        gallery._previewRows = rows;
+                    }});
                     content.innerHTML = '';
                     content.appendChild(pagesContainer);
 
@@ -980,10 +1241,31 @@ class PageRenderer:
                         pagesContainer.appendChild(currentPage);
                     }}
                     function overflows() {{ return currentPage.scrollHeight > currentPage.clientHeight + 1; }}
+                    function keepHeadingsWith(element) {{
+                        var headings = [], previous = element.previousElementSibling;
+                        while (previous && (
+                            previous.classList.contains('nb-page-header') ||
+                            previous.classList.contains('nb-db-title') ||
+                            previous.classList.contains('nb-db-group-title') ||
+                            previous.classList.contains('nb-heading_1') ||
+                            previous.classList.contains('nb-heading_2') ||
+                            previous.classList.contains('nb-heading_3')
+                        )) {{
+                            headings.unshift(previous); previous = previous.previousElementSibling;
+                        }}
+                        return headings;
+                    }}
+                    function moveToNewPageWithHeadings(element) {{
+                        var oldPage = currentPage, headings = keepHeadingsWith(element);
+                        element.remove(); headings.forEach(function(heading) {{ heading.remove(); }});
+                        newPage(); headings.forEach(function(heading) {{ currentPage.appendChild(heading); }});
+                        currentPage.appendChild(element);
+                        if (!oldPage.children.length) oldPage.remove();
+                    }}
                     function appendAtomic(child) {{
                         currentPage.appendChild(child);
                         if (overflows() && currentPage.children.length > 1) {{
-                            newPage(); currentPage.appendChild(child);
+                            moveToNewPageWithHeadings(child);
                         }}
                         if (overflows() && child.querySelector && child.querySelector('img')) {{
                             var image = child.querySelector('img');
@@ -999,25 +1281,51 @@ class PageRenderer:
                             if (overflows() && shell.children.length > 1) {{
                                 shell.removeChild(item); newPage(); shell = list.cloneNode(false);
                                 currentPage.appendChild(shell); shell.appendChild(item);
+                            }} else if (overflows() && shell.children.length === 1 && currentPage.children.length > 1) {{
+                                moveToNewPageWithHeadings(shell);
+                                shell = currentPage.lastElementChild;
                             }}
                         }});
                     }}
                     function appendGallery(gallery) {{
-                        var cards = Array.prototype.slice.call(gallery.children), shell = gallery.cloneNode(false);
+                        var rows = gallery._previewRows || [Array.prototype.slice.call(gallery.children)];
+                        var shell = gallery.cloneNode(false);
                         currentPage.appendChild(shell);
-                        cards.forEach(function(card) {{
-                            shell.appendChild(card);
-                            if (overflows()) {{
-                                if (shell.children.length > 1) {{
-                                    shell.removeChild(card); newPage(); shell = gallery.cloneNode(false);
-                                    currentPage.appendChild(shell); shell.appendChild(card);
-                                }} else if (currentPage.children.length > 1) {{
-                                    var label = shell.previousElementSibling;
-                                    if (!label || !label.classList.contains('nb-db-group-title')) label = null;
-                                    shell.remove(); if (label) label.remove(); newPage();
-                                    if (label) currentPage.appendChild(label);
+                        function rowOverflows() {{
+                            return currentPage.scrollHeight > currentPage.clientHeight + {PREVIEW_ROW_OVERFLOW_TOLERANCE_PX};
+                        }}
+                        function rowExceedsPage(row) {{
+                            if (!row.length) return false;
+                            var availableHeight = Math.max(80, currentPage.clientHeight - 24);
+                            var rowHeight = Math.max.apply(null, row.map(function(card) {{
+                                return card.getBoundingClientRect().height;
+                            }}));
+                            return rowHeight > availableHeight;
+                        }}
+                        function fitOversizedRow(row) {{
+                            if (!row.length || !rowOverflows()) return;
+                            var rowHeight = Math.max.apply(null, row.map(function(card) {{
+                                return card.getBoundingClientRect().height;
+                            }}));
+                            var availableHeight = Math.max(80, currentPage.clientHeight - 24);
+                            if (rowHeight > availableHeight) {{
+                                var scale = Math.max(0.25, availableHeight / rowHeight);
+                                shell.style.zoom = String(scale);
+                            }}
+                        }}
+                        rows.forEach(function(row) {{
+                            row.forEach(function(card) {{ shell.appendChild(card); }});
+                            if (rowOverflows() || rowExceedsPage(row)) {{
+                                row.forEach(function(card) {{ shell.removeChild(card); }});
+                                if (shell.children.length) {{
+                                    newPage(); shell = gallery.cloneNode(false);
                                     currentPage.appendChild(shell);
+                                }} else if (currentPage.children.length > 1) {{
+                                    moveToNewPageWithHeadings(shell);
+                                    shell = currentPage.lastElementChild;
                                 }}
+                                row.forEach(function(card) {{ shell.appendChild(card); }});
+                                fitOversizedRow(row);
                             }}
                         }});
                     }}
@@ -1031,8 +1339,8 @@ class PageRenderer:
                                     shell.removeChild(group); newPage(); shell = grid.cloneNode(false);
                                     currentPage.appendChild(shell); shell.appendChild(group);
                                 }} else if (currentPage.children.length > 1) {{
-                                    shell.remove(); newPage(); shell = grid.cloneNode(false);
-                                    currentPage.appendChild(shell); shell.appendChild(group);
+                                    moveToNewPageWithHeadings(shell);
+                                    shell = currentPage.lastElementChild;
                                 }}
                                 if (overflows() && shell.children.length === 1) {{
                                     shell.remove();
@@ -1068,11 +1376,7 @@ class PageRenderer:
                                 if (next.children.length > (head ? 2 : 1)) {{
                                     next.removeChild(row); newPage(); next = makeTable(); next.appendChild(row);
                                 }} else if (currentPage.children.length > 1) {{
-                                    var label = outer.previousElementSibling;
-                                    if (!label || !label.classList.contains('nb-db-group-title')) label = null;
-                                    outer.remove(); if (label) label.remove(); newPage();
-                                    if (label) currentPage.appendChild(label);
-                                    currentPage.appendChild(outer);
+                                    moveToNewPageWithHeadings(outer);
                                 }}
                             }}
                         }});
@@ -1094,7 +1398,10 @@ class PageRenderer:
                     }});
 
                 }} catch (err) {{
+                    document.body.dataset.paginationError = String(err);
                     console.error('Preview pagination failed:', err);
+                }} finally {{
+                    document.body.dataset.paginationReady = 'true';
                 }}
             }}
             if (document.readyState === 'loading') {{
@@ -1144,7 +1451,7 @@ class PageRenderer:
         full_width: bool | None = None,
         view_type: str | None = None,
         group_by: str | None = None,
-        gallery_fit: bool | None = None,
+        gallery_fit: bool | str | None = None,
         gallery_size: str | None = None,
         database_options: dict[str, dict] | None = None,
     ) -> str:
@@ -1169,7 +1476,7 @@ class PageRenderer:
         full_width: bool | None = None,
         view_type: str | None = None,
         group_by: str | None = None,
-        gallery_fit: bool | None = None,
+        gallery_fit: bool | str | None = None,
         gallery_size: str | None = None,
         database_options: dict[str, dict] | None = None,
     ) -> str:
@@ -1183,6 +1490,7 @@ class PageRenderer:
             gallery_fit=gallery_fit,
             gallery_size=gallery_size,
             database_options=database_options,
+            preview_mode=True,
         )
         html_doc = result["html"]
         orientation = result["orientation"]
@@ -1199,17 +1507,23 @@ class PageRenderer:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
                 browser = p.chromium.launch()
-                page = browser.new_page()
-                page.goto(f"file:///{html_path.as_posix()}")
-                page.wait_for_load_state("networkidle")
-                page.pdf(
-                    path=output_path,
-                    format="A4",
-                    landscape=(orientation == "landscape"),
-                    print_background=True,
-                    margin={"top": "0", "bottom": "0", "left": "0", "right": "0"},
-                )
-                browser.close()
+                try:
+                    page = browser.new_page()
+                    page.goto(f"file:///{html_path.as_posix()}")
+                    page.wait_for_load_state("networkidle")
+                    page.wait_for_function("document.body.dataset.paginationReady === 'true'")
+                    pagination_error = page.get_attribute("body", "data-pagination-error")
+                    if pagination_error:
+                        raise RuntimeError(f"PDF pagination failed: {pagination_error}")
+                    page.pdf(
+                        path=output_path,
+                        format="A4",
+                        landscape=(orientation == "landscape"),
+                        print_background=True,
+                        margin={"top": "0", "bottom": "0", "left": "0", "right": "0"},
+                    )
+                finally:
+                    browser.close()
         except Exception as exc:
             LOGGER.error("PDF generation failed: %s", exc)
             raise
@@ -1228,7 +1542,7 @@ class PageRenderer:
         full_width: bool | None = None,
         view_type: str | None = None,
         group_by: str | None = None,
-        gallery_fit: bool | None = None,
+        gallery_fit: bool | str | None = None,
         gallery_size: str | None = None,
         database_options: dict[str, dict] | None = None,
     ) -> str:

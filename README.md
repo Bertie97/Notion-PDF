@@ -1,10 +1,11 @@
 # Notion-PDF
 
-A Python tool that exports a Notion page to a styled PDF using the Notion API and a headless browser renderer. It includes both a command-line interface and a visual GUI with live A4 preview.
+A Python tool that exports a Notion page or database to a styled PDF using the Notion API and a headless browser renderer. It includes both a command-line interface and a visual GUI with live A4 preview.
 
 ## Features
 
 - Renders page properties as a compact info bar under the title.
+- Accepts full-page database links and follows the view selected in the link.
 - Supports common Notion blocks: paragraphs, headings, lists, toggles, callouts, code, tables, images, columns, bookmarks, embeds, equations, etc.
 - Reads each child database's Notion views and renders its selected table / gallery / list configuration.
 - Preserves view sorting, grouping order, visible properties and property presentation metadata.
@@ -64,7 +65,7 @@ python -m notion_pdf "https://www.notion.so/YourPageTitle-0123456789abcdef012345
 | `--database-view` | Select a view for one database (`DATABASE_ID=VIEW_ID`, repeatable) |
 | `--database-group` | Select a grouping property for one database |
 | `--database-gallery-size` | Set `follow`, `small`, `medium`, or `large` per database |
-| `--database-media-fit` | Set `follow`, `contain`, or `cover` per database |
+| `--database-media-fit` | Set `follow`, `contain`, `cover`, or `auto` (subject-aligned) per database |
 | `--verbose, -v` | Debug logging |
 
 ### CLI example
@@ -97,7 +98,7 @@ python -m notion_pdf.gui
 
 ### How to use
 
-1. Paste the Notion page URL and provide the token:
+1. Paste the Notion page or database URL and provide the token:
    - Enable **使用口令文件** to browse for a token file, or
    - Disable it to paste the token directly.
 2. The page loads automatically once both URL and token are present.

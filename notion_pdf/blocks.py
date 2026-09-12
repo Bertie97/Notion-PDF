@@ -1,8 +1,10 @@
 """Block parsing and database rendering helpers."""
 
 import html
+import hashlib
 import logging
-from urllib.parse import unquote
+import base64
+from urllib.parse import quote, unquote, urlparse
 from typing import Any
 
 from .utils import (
@@ -13,6 +15,14 @@ from .utils import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+# At the gallery's widest A4 landscape layout these widths provide roughly
+# 300 PPI, while avoiding full-resolution downloads for card-sized images.
+GALLERY_IMAGE_WIDTHS = {
+    "small": 640,
+    "medium": 1024,
+    "large": 1600,
+}
 
 
 def block_caption(block: dict) -> str:
@@ -180,9 +190,23 @@ def render_table_block(block: dict) -> str:
 
 def render_database(db: dict, entries: list[dict], view_type: str, ctx: dict) -> str:
     """Render a database according to requested view type, optionally grouped."""
-    entries = _sort_entries(entries, ctx.get("view", {}).get("sorts") or [])
-    group_by = ctx.get("group_by")
     schema = db.get("properties", {})
+    title_html = ""
+    if ctx.get("show_title", True):
+        title_html = f'<div class="nb-db-title">{html.escape(str(ctx.get("database_title") or "数据库"))}</div>'
+    view = ctx.get("view") or {}
+    sort_mode = ctx.get("sort_mode")
+    if sort_mode == "random":
+        entries = sorted(entries, key=lambda entry: hashlib.sha256(entry.get("id", "").encode("utf-8")).hexdigest())
+    elif sort_mode == "page_id":
+        entries = _sort_entries_by_page_id(entries)
+    elif sort_mode == "property":
+        entries = _sort_entries_by_property(entries, ctx.get("sort_property"), schema)
+    else:
+        # Preserve the previous renderer behavior for callers that do not
+        # provide an explicit GUI sort mode.
+        entries = _sort_entries(entries, _view_sorts(view), schema)
+    group_by = ctx.get("group_by")
     if group_by and group_by in schema:
         groups = _group_entries(entries, group_by, schema, ctx.get("view"))
         grouped_gallery = view_type == "gallery"
@@ -203,12 +227,12 @@ def render_database(db: dict, entries: list[dict], view_type: str, ctx: dict) ->
             parts.append('</div>')
         if grouped_gallery:
             parts.append('</div>')
-        return "".join(parts)
+        return title_html + "".join(parts)
     if view_type == "gallery":
-        return render_database_gallery(db, entries, ctx)
+        return title_html + render_database_gallery(db, entries, ctx)
     if view_type == "list":
-        return render_database_list(db, entries, ctx)
-    return render_database_table(db, entries, ctx)
+        return title_html + render_database_list(db, entries, ctx)
+    return title_html + render_database_table(db, entries, ctx)
 
 
 def _group_entries(entries: list[dict], group_by: str, schema: dict,
@@ -234,13 +258,32 @@ def _group_entries(entries: list[dict], group_by: str, schema: dict,
     return dict(sorted(groups.items(), key=key_fn, reverse=sort_type == "descending"))
 
 
-def _sort_entries(entries: list[dict], sorts: list[dict]) -> list[dict]:
+def _view_sorts(view: dict | None) -> list[dict]:
+    view = view or {}
+    if "sorts" in view:
+        return view.get("sorts") or []
+    return (view.get("configuration") or {}).get("sorts") or []
+
+
+def _sort_entries(entries: list[dict], sorts: list[dict], schema: dict | None = None) -> list[dict]:
     ordered = list(entries)
     for spec in reversed(sorts):
         prop_name = spec.get("property")
+        if not prop_name and schema:
+            property_id = unquote(str(spec.get("property_id", "")))
+            prop_name = next(
+                (name for name, prop in schema.items() if unquote(str(prop.get("id", ""))) == property_id),
+                None,
+            )
         if not prop_name:
             continue
         reverse = spec.get("direction") == "descending"
+        if schema and prop_name in schema and _schema_has_options(schema[prop_name]):
+            ordered.sort(
+                key=lambda entry: _schema_property_sort_key(entry, prop_name, schema[prop_name]),
+                reverse=reverse,
+            )
+            continue
         ordered.sort(
             key=lambda entry: (
                 not bool(property_value_to_str(entry.get("properties", {}).get(prop_name, {}))),
@@ -249,6 +292,41 @@ def _sort_entries(entries: list[dict], sorts: list[dict]) -> list[dict]:
             reverse=reverse,
         )
     return ordered
+
+
+def _sort_entries_by_property(entries: list[dict], prop_name: str | None, schema: dict) -> list[dict]:
+    if not prop_name or prop_name not in schema:
+        return list(entries)
+    return sorted(entries, key=lambda entry: _schema_property_sort_key(entry, prop_name, schema[prop_name]))
+
+
+def _sort_entries_by_page_id(entries: list[dict]) -> list[dict]:
+    """Sort by normalized Notion page UUID, keeping malformed entries last."""
+    return sorted(
+        entries,
+        key=lambda entry: (
+            not bool(entry.get("id")),
+            str(entry.get("id", "")).replace("-", "").casefold(),
+        ),
+    )
+
+
+def _schema_has_options(prop_schema: dict) -> bool:
+    ptype = prop_schema.get("type", "")
+    return bool(prop_schema.get(ptype, {}).get("options"))
+
+
+def _schema_property_sort_key(entry: dict, prop_name: str, prop_schema: dict):
+    ptype = prop_schema.get("type", "")
+    options = prop_schema.get(ptype, {}).get("options", [])
+    option_order = {option.get("name", ""): index for index, option in enumerate(options)}
+    value_data = entry.get("properties", {}).get(prop_name, {})
+    value = property_value_to_str(value_data)
+    if ptype == "multi_select":
+        names = [item.get("name", "") for item in value_data.get("multi_select", []) or []]
+        option_key = tuple(option_order.get(name, len(option_order)) for name in names)
+        return (not bool(names), option_key, value.casefold())
+    return (not bool(value), option_order.get(value, len(option_order)), value.casefold())
 
 
 def _group_key(entry: dict, group_by: str, schema: dict) -> str:
@@ -284,12 +362,17 @@ def render_database_gallery(db: dict, entries: list[dict], ctx: dict) -> str:
     schema = db.get("properties", {})
     props = _view_props(schema, ctx.get("view"))
     size = ctx.get("gallery_size", "medium")
-    fit_class = "nb-db-gallery-fit" if ctx.get("gallery_fit") else ""
+    fit_mode = ctx.get("gallery_fit")
+    fit_class = "nb-db-gallery-fit" if fit_mode is True else (
+        "nb-db-gallery-fit-top" if fit_mode == "top" else (
+            "nb-db-gallery-fit-auto" if fit_mode == "auto" else ""
+        )
+    )
     size_class = f"nb-db-gallery-{size}"
     cards = []
     for idx, entry in enumerate(entries):
         title = _entry_title(entry, schema)
-        cover = _entry_cover(entry, ctx)
+        cover, cover_block_id = _entry_cover(entry, ctx)
         icon = _entry_icon(entry)
         fields = []
         for prop_name in props:
@@ -304,7 +387,9 @@ def render_database_gallery(db: dict, entries: list[dict], ctx: dict) -> str:
                     f'<span class="nb-db-gallery-value">{val_html}</span>'
                     f'</div>'
                 )
-        cover_html = _gallery_cover_html(cover, icon, title, idx, ctx)
+        cover_html = _gallery_cover_html(
+            cover, cover_block_id, icon, title, idx, ctx
+        )
         card = (
             f'<div class="nb-db-gallery-card">{cover_html}'
             f'<div class="nb-db-gallery-body">'
@@ -315,12 +400,36 @@ def render_database_gallery(db: dict, entries: list[dict], ctx: dict) -> str:
     return f'<div class="nb-db nb-db-gallery {fit_class} {size_class}">{"".join(cards)}</div>'
 
 
-def _gallery_cover_html(cover: str, icon: str | None, title: str, idx: int, ctx: dict | None = None) -> str:
-    fit_class = "nb-db-gallery-cover-fit" if (ctx and ctx.get("gallery_fit")) else ""
+def _gallery_cover_html(
+    cover: str,
+    cover_block_id: str,
+    icon: str | None,
+    title: str,
+    idx: int,
+    ctx: dict | None = None,
+) -> str:
+    fit_mode = ctx.get("gallery_fit") if ctx else None
+    fit_class = "nb-db-gallery-cover-fit" if fit_mode is True else (
+        "nb-db-gallery-cover-fit-top" if fit_mode == "top" else (
+            "nb-db-gallery-cover-fit-auto" if fit_mode == "auto" else ""
+        )
+    )
     if cover:
+        size = (ctx or {}).get("gallery_size", "medium")
+        optimized_cover = _notion_resized_image_url(cover, cover_block_id, size)
+        source_attributes = f'src="{html.escape(optimized_cover, quote=True)}" crossorigin="anonymous"'
+        if fit_mode == "auto":
+            mask_url = _foreground_mask_data_url(cover, ctx)
+            if mask_url:
+                source_attributes += f' data-foreground-mask="{html.escape(mask_url, quote=True)}"'
+        if optimized_cover != cover:
+            source_attributes += (
+                f' data-fallback-src="{html.escape(cover, quote=True)}"'
+                ' onerror="this.onerror=null;this.src=this.dataset.fallbackSrc"'
+            )
         return (
             f'<div class="nb-db-gallery-cover {fit_class}">'
-            f'<img src="{html.escape(cover)}" alt="{html.escape(title)}"/>'
+            f'<img {source_attributes} alt="{html.escape(title, quote=True)}"/>'
             f'</div>'
         )
     # No cover: use a vector panel with an icon or initial letter.
@@ -332,6 +441,25 @@ def _gallery_cover_html(cover: str, icon: str | None, title: str, idx: int, ctx:
         f'<div class="nb-db-gallery-cover-icon">{icon_html}</div>'
         f'</div>'
     )
+
+
+def _foreground_mask_data_url(url: str, ctx: dict | None) -> str:
+    """Generate a local U2NetP mask for adaptive gallery positioning when available."""
+    if not url or not ctx or not ctx.get("client"):
+        return ""
+    cache = ctx.setdefault("foreground_mask_cache", {})
+    if url in cache:
+        return cache[url] or ""
+    try:
+        from .foreground import mask_png
+        image_bytes = ctx["client"].download_file(url)
+        result = mask_png(url, image_bytes)
+        value = f"data:image/png;base64,{base64.b64encode(result).decode('ascii')}" if result else ""
+    except Exception as exc:
+        LOGGER.debug("Could not segment gallery cover %s: %s", url, exc)
+        value = ""
+    cache[url] = value
+    return value
 
 
 def _entry_icon(entry: dict) -> dict | None:
@@ -386,23 +514,34 @@ def _entry_title(entry: dict, schema: dict) -> str:
     return "Untitled"
 
 
-def _entry_cover(entry: dict, ctx: dict | None = None) -> str:
+def _notion_resized_image_url(source_url: str, block_id: str, size: str) -> str:
+    """Return Notion's width-limited image URL, or the source when unsupported."""
+    if not block_id or urlparse(source_url).scheme not in ("http", "https"):
+        return source_url
+    width = GALLERY_IMAGE_WIDTHS.get(size, GALLERY_IMAGE_WIDTHS["medium"])
+    return (
+        f"https://www.notion.so/image/{quote(source_url, safe='')}"
+        f"?table=block&id={quote(block_id, safe='')}&width={width}&cache=v2"
+    )
+
+
+def _entry_cover(entry: dict, ctx: dict | None = None) -> tuple[str, str]:
     cover = entry.get("cover")
+    entry_id = entry.get("id", "")
     if cover:
         if cover.get("type") == "external":
-            return cover.get("external", {}).get("url", "")
+            return cover.get("external", {}).get("url", ""), entry_id
         if cover.get("type") == "file":
-            return cover.get("file", {}).get("url", "")
+            return cover.get("file", {}).get("url", ""), entry_id
     # Fallback: use the first image block of the entry page as cover.
-    eid = entry.get("id")
-    if ctx and eid:
-        blocks = ctx.get("entry_blocks_cache", {}).get(eid, [])
+    if ctx and entry_id:
+        blocks = ctx.get("entry_blocks_cache", {}).get(entry_id, [])
         for block in blocks:
             if block.get("type") == "image":
                 url, _ = _image_src(block)
                 if url:
-                    return url
-    return ""
+                    return url, block.get("id", entry_id)
+    return "", ""
 
 
 def _image_src(block: dict):

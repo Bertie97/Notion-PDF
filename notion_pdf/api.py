@@ -5,7 +5,7 @@ from typing import Any
 
 import requests
 
-from .utils import extract_page_id, format_uuid
+from .utils import extract_page_id, extract_view_id, format_uuid, plain_text_from_rich
 
 LOGGER = logging.getLogger(__name__)
 BASE = "https://api.notion.com/v1"
@@ -130,10 +130,64 @@ class NotionClient:
         return results
 
     def get_page_with_blocks(self, page_url_or_id: str) -> dict:
-        page = self.get_page(page_url_or_id)
+        try:
+            page = self.get_page(page_url_or_id)
+        except requests.HTTPError as exc:
+            if not self._is_database_not_page_error(exc):
+                raise
+            return self._get_database_document(page_url_or_id)
         page_id = page["id"]
         blocks = self.get_block_children(page_id)
         return {"page": page, "blocks": blocks}
+
+    @staticmethod
+    def _is_database_not_page_error(exc: requests.HTTPError) -> bool:
+        response = exc.response
+        if response is None or response.status_code != 400:
+            return False
+        try:
+            error = response.json()
+        except ValueError:
+            return False
+        return (
+            error.get("code") == "validation_error"
+            and "is a database, not a page" in error.get("message", "")
+        )
+
+    def _get_database_document(self, database_url_or_id: str) -> dict:
+        database_id = format_uuid(extract_page_id(database_url_or_id))
+        database, entries, views = self.get_database_bundle(database_id)
+        database_meta = database.get("_database", database)
+        title = database_meta.get("title", [])
+        title_text = plain_text_from_rich(title) or database.get("name") or "Untitled"
+        requested_view_id = extract_view_id(database_url_or_id)
+
+        database["_views"] = views
+        database["_database_id"] = database_id
+        database["_root_database"] = True
+        database["_requested_view_id"] = requested_view_id
+
+        page = {
+            "object": "page",
+            "id": database_id,
+            "icon": database_meta.get("icon"),
+            "cover": database_meta.get("cover"),
+            "parent": database_meta.get("parent", {}),
+            "properties": {
+                "title": {"type": "title", "title": title or [{"plain_text": title_text}]}
+            },
+        }
+        block = {
+            "object": "block",
+            "id": database_id,
+            "type": "child_database",
+            "has_children": False,
+            "child_database": {"title": title_text},
+            "_db": database,
+            "_entries": entries,
+            "_root_database": True,
+        }
+        return {"page": page, "blocks": [block]}
 
     def download_file(self, url: str) -> bytes:
         resp = requests.get(url, timeout=120)

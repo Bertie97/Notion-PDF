@@ -2,7 +2,7 @@
 
 import re
 import uuid
-from urllib.parse import urlparse, unquote
+from urllib.parse import parse_qs, urlparse, unquote
 
 
 NOTION_PAGE_RE = re.compile(
@@ -24,6 +24,17 @@ def extract_page_id(url: str) -> str:
         raise ValueError(f"Could not extract Notion page id from URL: {url}")
     # normalize uuid form to 32-char raw id
     return raw.replace("-", "").lower()
+
+
+def extract_view_id(url: str) -> str | None:
+    """Extract and normalize the optional view id from a Notion database URL."""
+    values = parse_qs(urlparse(url.strip()).query).get("v", [])
+    if not values:
+        return None
+    raw = values[0].replace("-", "")
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", raw):
+        return None
+    return format_uuid(raw)
 
 
 def format_uuid(raw_id: str) -> str:

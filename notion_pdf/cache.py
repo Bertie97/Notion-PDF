@@ -6,9 +6,37 @@ import json
 import os
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from .utils import extract_page_id
+
+
+def _is_expired_signed_url(value: str, now: datetime | None = None) -> bool:
+    """Return whether a Notion/S3 signed URL has passed its query expiry."""
+    parsed = urlparse(value)
+    query = parse_qs(parsed.query)
+    signed_date = query.get("X-Amz-Date", [""])[0]
+    expires = query.get("X-Amz-Expires", [""])[0]
+    if not signed_date or not expires:
+        return False
+    try:
+        issued_at = datetime.strptime(signed_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        expires_at = issued_at + timedelta(seconds=int(expires))
+    except (TypeError, ValueError):
+        return False
+    return (now or datetime.now(timezone.utc)) >= expires_at
+
+
+def _contains_expired_signed_url(value) -> bool:
+    if isinstance(value, str):
+        return _is_expired_signed_url(value)
+    if isinstance(value, dict):
+        return any(_contains_expired_signed_url(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_expired_signed_url(item) for item in value)
+    return False
 
 
 class PageDataCache:
@@ -38,7 +66,10 @@ class PageDataCache:
         try:
             with gzip.open(path, "rt", encoding="utf-8") as handle:
                 payload = json.load(handle)
-            return payload["data"], float(payload.get("saved_at", path.stat().st_mtime))
+            data = payload["data"]
+            if _contains_expired_signed_url(data):
+                return None
+            return data, float(payload.get("saved_at", path.stat().st_mtime))
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             return None
 

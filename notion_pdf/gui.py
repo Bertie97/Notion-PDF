@@ -9,8 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEvent, QSettings, QThread, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QEvent, QSettings, QSize, QThread, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QStyle,
     QStackedLayout,
     QStackedWidget,
     QTabWidget,
@@ -137,6 +138,69 @@ class Card(QFrame):
         self.layout = layout
 
 
+class MarginControl(QWidget):
+    """A platform-neutral numeric control with compact split step buttons."""
+
+    valueChanged = Signal(float)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.spin = QDoubleSpinBox()
+        self.spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        self.spin.valueChanged.connect(self.valueChanged)
+        layout.addWidget(self.spin)
+
+        buttons = QFrame()
+        self.buttons = buttons
+        buttons.setObjectName("marginButtons")
+        buttons.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        buttons.setFixedWidth(26)
+        button_layout = QVBoxLayout(buttons)
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(0)
+        self.up_button = QToolButton()
+        self.up_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
+        self.up_button.setToolTip("增大页边距")
+        self.up_button.clicked.connect(self.spin.stepUp)
+        self.down_button = QToolButton()
+        self.down_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
+        self.down_button.setToolTip("减小页边距")
+        self.down_button.clicked.connect(self.spin.stepDown)
+        for button in (self.up_button, self.down_button):
+            button.setObjectName("marginStepButton")
+            button.setFixedSize(24, 20)
+            button.setIconSize(QSize(12, 12))
+            button.setCursor(Qt.PointingHandCursor)
+            button_layout.addWidget(button)
+        layout.addWidget(buttons)
+
+    def sync_button_height(self):
+        """Match the custom button rail to the styled spin box outer height."""
+        height = self.spin.sizeHint().height()
+        self.spin.setFixedHeight(height)
+        self.buttons.setFixedHeight(height)
+
+    def setRange(self, minimum: float, maximum: float):
+        self.spin.setRange(minimum, maximum)
+
+    def setDecimals(self, decimals: int):
+        self.spin.setDecimals(decimals)
+
+    def setSuffix(self, suffix: str):
+        self.spin.setSuffix(suffix)
+
+    def setValue(self, value: float):
+        self.spin.setValue(value)
+
+    def value(self) -> float:
+        return self.spin.value()
+
+
 class NotionPdfWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -154,6 +218,7 @@ class NotionPdfWindow(QMainWindow):
         self._preview_busy = False
         self._preview_pending = False
         self._export_busy = False
+        self._show_adaptive_masks = False
         self.db_controls: dict[str, dict[str, QWidget]] = {}
         self.page_cache = PageDataCache()
         self._has_cached_page = False
@@ -197,16 +262,21 @@ class NotionPdfWindow(QMainWindow):
         header.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         left_layout.addWidget(header)
 
+        subtitle = QLabel("将 Notion 页面整理为清晰、可打印的 PDF 文档")
+        subtitle.setObjectName("appSubtitle")
+        subtitle.setWordWrap(True)
+        left_layout.addWidget(subtitle)
+
         # Notion URL
-        url_card = Card("Notion 页面链接")
+        url_card = Card("Notion 页面或数据库链接")
         self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("https://www.notion.so/...")
+        self.url_input.setPlaceholderText("https://app.notion.com/p/...")
         url_card.layout.addWidget(self.url_input)
         left_layout.addWidget(url_card)
 
         # Token source
         self.token_source_check = QCheckBox("使用令牌文件")
-        self.token_source_check.setChecked(True)
+        self.token_source_check.setChecked(False)
         self.token_source_check.stateChanged.connect(self._on_token_source_changed)
         token_card = Card("访问令牌", right_widget=self.token_source_check)
         token_card.setFixedHeight(132)
@@ -267,7 +337,7 @@ class NotionPdfWindow(QMainWindow):
         self.orientation_combo.addItem("自动", "auto")
         self.orientation_combo.addItem("纵向", "portrait")
         self.orientation_combo.addItem("横向", "landscape")
-        self.margin_spin = QDoubleSpinBox()
+        self.margin_spin = MarginControl()
         self.margin_spin.setRange(5, 50)
         self.margin_spin.setValue(15)
         self.margin_spin.setDecimals(1)
@@ -348,8 +418,12 @@ class NotionPdfWindow(QMainWindow):
         toolbar_layout.setContentsMargins(6, 6, 6, 6)
         toolbar_layout.setSpacing(4)
         self.refresh_btn = QToolButton()
-        self.refresh_btn.setIcon(self._fluent_outline_icon("\ue72c"))
+        self.refresh_btn.setIcon(self._outline_icon("refresh.svg"))
         self.refresh_btn.setToolTip("刷新 Notion 页面")
+        self.mask_btn = QToolButton()
+        self.mask_btn.setIcon(self._outline_icon("eye.svg"))
+        self.mask_btn.setToolTip("显示主体识别辅助图层")
+        self.mask_btn.setCheckable(True)
         self.zoom_out_btn = QToolButton()
         self.zoom_out_btn.setText("−")
         self.zoom_out_btn.setToolTip("缩小预览")
@@ -357,10 +431,10 @@ class NotionPdfWindow(QMainWindow):
         self.zoom_in_btn.setText("+")
         self.zoom_in_btn.setToolTip("放大预览")
         self.export_fab = QToolButton()
-        self.export_fab.setIcon(self._fluent_outline_icon("\ue74e"))
+        self.export_fab.setIcon(self._outline_icon("save.svg"))
         self.export_fab.setToolTip("保存 PDF / HTML")
         self.export_fab.setEnabled(False)
-        for button in (self.refresh_btn, self.zoom_out_btn, self.zoom_in_btn, self.export_fab):
+        for button in (self.mask_btn, self.refresh_btn, self.zoom_out_btn, self.zoom_in_btn, self.export_fab):
             button.setCursor(Qt.PointingHandCursor)
             button.setFixedSize(38, 38)
             toolbar_layout.addWidget(button)
@@ -377,85 +451,111 @@ class NotionPdfWindow(QMainWindow):
     def _apply_styles(self):
         self.setStyleSheet("""
             QMainWindow {
-                background-color: #f5f5f7;
+                background-color: #f3f6fa;
             }
             #appHeader {
-                font-size: 26px;
+                font-size: 28px;
                 font-weight: 700;
-                color: #1d1d1f;
-                padding-bottom: 8px;
+                color: #152238;
+                padding: 4px 4px 0 4px;
+            }
+            #appSubtitle {
+                font-size: 13px;
+                color: #6e829c;
+                padding: 0 4px 5px 4px;
             }
             #card {
                 background-color: #ffffff;
-                border-radius: 16px;
-                border: 1px solid #e5e5ea;
+                border-radius: 12px;
+                border: 1px solid #d8e3f0;
             }
             #cardTitle {
-                font-size: 13px;
-                font-weight: 600;
-                color: #6e6e73;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-                margin-bottom: 4px;
+                font-size: 15px;
+                font-weight: 700;
+                color: #1d2d44;
+                padding-bottom: 2px;
             }
             QLineEdit, QComboBox, QDoubleSpinBox {
-                padding: 10px 12px;
-                border: 1px solid #d2d2d7;
-                border-radius: 10px;
-                background-color: #fafafc;
+                padding: 9px 12px;
+                border: 1px solid #cbd9e8;
+                border-radius: 8px;
+                background-color: #f7fafe;
                 font-size: 13px;
-                color: #1d1d1f;
+                color: #1d2d44;
+                min-height: 18px;
             }
             QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus {
-                border: 1.5px solid #0071e3;
+                border: 1px solid #1683f7;
+                background-color: #ffffff;
             }
             QComboBox::drop-down {
                 border: none;
                 width: 24px;
             }
+            MarginControl QDoubleSpinBox {
+                border-top-right-radius: 0;
+                border-bottom-right-radius: 0;
+            }
+            #marginButtons {
+                background-color: #f7fafe;
+                border: 1px solid #cbd9e8;
+                border-left: none;
+                border-top-right-radius: 10px;
+                border-bottom-right-radius: 10px;
+                padding: 0;
+                margin: 0;
+            }
+            #marginStepButton {
+                color: #6e6e73;
+                background: transparent;
+                border: none;
+                padding: 0;
+                margin: 0;
+            }
+            #marginStepButton:hover { color: #0071e3; background-color: #e8f2ff; }
             QCheckBox {
                 font-size: 13px;
-                color: #1d1d1f;
+                color: #24364f;
                 spacing: 8px;
             }
             QCheckBox::indicator {
                 width: 18px;
                 height: 18px;
                 border-radius: 5px;
-                border: 1px solid #d2d2d7;
-                background-color: #fafafc;
+                border: 1px solid #cbd9e8;
+                background-color: #f7fafe;
             }
             QCheckBox::indicator:checked {
                 background-color: #0071e3;
                 border-color: #0071e3;
             }
             #primaryBtn {
-                background-color: #0071e3;
+                background-color: #0b73e8;
                 color: white;
                 border: none;
-                border-radius: 10px;
+                border-radius: 8px;
                 padding: 10px 18px;
                 font-size: 13px;
                 font-weight: 600;
             }
             #primaryBtn:hover {
-                background-color: #0077ed;
+                background-color: #0868d3;
             }
             #primaryBtn:disabled {
                 background-color: #d2d2d7;
                 color: #8e8e93;
             }
             #secondaryBtn {
-                background-color: #e8e8ed;
-                color: #1d1d1f;
-                border: none;
-                border-radius: 10px;
+                background-color: #edf4fc;
+                color: #176dcc;
+                border: 1px solid #c5dcf5;
+                border-radius: 8px;
                 padding: 8px 14px;
                 font-size: 13px;
                 font-weight: 600;
             }
             #secondaryBtn:hover {
-                background-color: #dedee3;
+                background-color: #e1effd;
             }
             #fabBtn {
                 background-color: #0071e3;
@@ -476,9 +576,9 @@ class NotionPdfWindow(QMainWindow):
                 box-shadow: none;
             }
             #previewToolbar {
-                background-color: rgba(32, 32, 35, 225);
-                border: 1px solid #4a4a4f;
-                border-radius: 8px;
+                background-color: rgba(24, 43, 69, 235);
+                border: 1px solid #38516f;
+                border-radius: 9px;
             }
             #previewToolbar QToolButton {
                 color: white;
@@ -491,25 +591,61 @@ class NotionPdfWindow(QMainWindow):
             #previewToolbar QToolButton:disabled { color: #77777c; }
             #statusLabel {
                 font-size: 12px;
-                color: #6e6e73;
+                color: #6e829c;
                 padding-top: 4px;
             }
             #previewHeader {
                 background-color: #ffffff;
-                color: #1d1d1f;
-                font-size: 13px;
-                font-weight: 600;
-                padding: 14px 20px;
-                border-bottom: 1px solid #e5e5ea;
+                color: #1d2d44;
+                font-size: 15px;
+                font-weight: 700;
+                padding: 16px 20px;
+                border-bottom: 1px solid #d8e3f0;
             }
             QLabel {
                 font-size: 13px;
-                color: #1d1d1f;
+                color: #24364f;
+            }
+            QTabWidget::pane {
+                border: 1px solid #d8e3f0;
+                border-radius: 8px;
+                background: #fbfdff;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background: #edf4fc;
+                color: #5e7693;
+                border: 1px solid #d8e3f0;
+                padding: 7px 13px;
+                margin-right: 3px;
+                border-top-left-radius: 7px;
+                border-top-right-radius: 7px;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                color: #0b73e8;
+                border-bottom-color: #ffffff;
+                font-weight: 600;
+            }
+            QScrollBar:vertical {
+                width: 9px;
+                background: transparent;
+                margin: 4px 1px 4px 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #c5d5e6;
+                border-radius: 4px;
+                min-height: 30px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
             }
         """)
+        self.margin_spin.sync_button_height()
 
     def _connect_signals(self):
         self.export_fab.clicked.connect(self._export_pdf)
+        self.mask_btn.toggled.connect(self._toggle_adaptive_masks)
         self.refresh_btn.clicked.connect(self._refresh_page)
         self.zoom_in_btn.clicked.connect(lambda: self._change_preview_zoom(0.1))
         self.zoom_out_btn.clicked.connect(lambda: self._change_preview_zoom(-0.1))
@@ -534,21 +670,11 @@ class NotionPdfWindow(QMainWindow):
                 widget.valueChanged.connect(self._schedule_preview)
             elif isinstance(widget, QCheckBox):
                 widget.stateChanged.connect(self._schedule_preview)
+        self.margin_spin.valueChanged.connect(lambda _value: self._schedule_preview())
 
     @staticmethod
-    def _fluent_outline_icon(glyph: str, size: int = 22) -> QIcon:
-        result = QPixmap(size, size)
-        result.fill(Qt.transparent)
-        painter = QPainter(result)
-        painter.setRenderHint(QPainter.TextAntialiasing)
-        font = QFont("Segoe Fluent Icons", 15)
-        if not QFont("Segoe Fluent Icons").exactMatch():
-            font = QFont("Segoe MDL2 Assets", 15)
-        painter.setFont(font)
-        painter.setPen(QColor("#ffffff"))
-        painter.drawText(result.rect(), Qt.AlignCenter, glyph)
-        painter.end()
-        return QIcon(result)
+    def _outline_icon(filename: str) -> QIcon:
+        return QIcon(str(Path(__file__).with_name("assets") / filename))
 
     def eventFilter(self, watched, event):
         if watched in (self.preview_container, self.preview, self.preview_toolbar):
@@ -585,16 +711,20 @@ class NotionPdfWindow(QMainWindow):
         )
         if path:
             self.token_file_input.setText(path)
+            self.token_source_check.setChecked(True)
             self._maybe_auto_load()
 
     def _on_token_source_changed(self, state: int):
         self.token_stack.setCurrentIndex(0 if self.token_source_check.isChecked() else 1)
 
     def _load_settings(self):
-        self.token_source_check.setChecked(
-            self.settings.value("token_source_is_file", True) in (True, "true", "1")
-        )
-        self.token_file_input.setText(self.settings.value("token_file_path", ""))
+        token_file_path = self.settings.value("token_file_path", "")
+        if self.settings.contains("token_source_is_file"):
+            use_token_file = self.settings.value("token_source_is_file") in (True, "true", "1")
+        else:
+            use_token_file = bool(str(token_file_path).strip())
+        self.token_source_check.setChecked(use_token_file)
+        self.token_file_input.setText(token_file_path)
         self.token_paste_input.setText(self.settings.value("token_paste", ""))
         self.full_width_cb.setChecked(self.settings.value("full_width", False) in (True, "true", "1"))
         orientation = self.settings.value("orientation", "auto")
@@ -677,7 +807,7 @@ class NotionPdfWindow(QMainWindow):
         url = self.url_input.text().strip()
         LOGGER.info("Starting load for URL: %s", url)
         if not url:
-            QMessageBox.warning(self, "缺少输入", "请输入 Notion 页面链接。")
+            QMessageBox.warning(self, "缺少输入", "请输入 Notion 页面或数据库链接。")
             return
         token = self._current_token()
         if not token:
@@ -731,6 +861,81 @@ class NotionPdfWindow(QMainWindow):
         walk(data.get("blocks", []))
         return found
 
+    @staticmethod
+    def _view_configuration(view: dict | None) -> dict:
+        return (view or {}).get("configuration") or {}
+
+    @classmethod
+    def _view_has_setting(cls, view: dict | None, name: str) -> bool:
+        return name in (view or {}) or name in cls._view_configuration(view)
+
+    @staticmethod
+    def _set_combo_items(combo: QComboBox, items: list[tuple[str, object]], preferred=None):
+        current = combo.currentData()
+        selected = preferred if preferred is not None else current
+        combo.blockSignals(True)
+        combo.clear()
+        for label, data in items:
+            combo.addItem(label, data)
+        index = next(
+            (item_index for item_index in range(combo.count()) if combo.itemData(item_index) == selected),
+            -1,
+        )
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _populate_database_options(self, db_id: str, db: dict, preferred: dict | None = None):
+        controls = self.db_controls[db_id]
+        view_id = controls["view"].currentData()
+        view = next((item for item in db.get("_views", []) if item.get("id") == view_id), None)
+        config = self._view_configuration(view)
+        preferred = preferred or {}
+
+        group_items = []
+        if self._view_has_setting(view, "group_by"):
+            group_items.append(("跟随视图", "__follow_view__"))
+        group_items.append(("不分组", ""))
+        for name, prop in db.get("properties", {}).items():
+            if prop.get("type") in ("select", "multi_select", "status", "people", "checkbox"):
+                group_items.append((name, name))
+        self._set_combo_items(controls["group"], group_items, preferred.get("group_by"))
+
+        controls["show_title"].blockSignals(True)
+        controls["show_title"].setChecked(
+            preferred.get("show_title", not db.get("_root_database", False))
+        )
+        controls["show_title"].blockSignals(False)
+
+        fit_items = [
+            ("跟随视图", "__follow_view__"),
+            ("自适应（主体对齐）", "auto"),
+            ("顶部对齐", "top"),
+            ("完整显示（Contain）", True),
+            ("填充裁剪（Cover）", False),
+        ]
+        self._set_combo_items(controls["fit"], fit_items, preferred.get("gallery_fit"))
+
+        size_items = []
+        if self._view_has_setting(view, "cover_size"):
+            size_items.append(("跟随视图", "__follow_view__"))
+        size_items.extend([("小", "small"), ("中", "medium"), ("大", "large")])
+        self._set_combo_items(controls["size"], size_items, preferred.get("gallery_size"))
+
+        sort_items = [
+            ("随机", ("random", None)),
+            ("页面 ID", ("page_id", None)),
+        ]
+        for name in db.get("properties", {}):
+            sort_items.append((name, ("property", name)))
+        sort_preferred = preferred.get("sort", controls["sort"].currentData())
+        if sort_preferred is None:
+            sort_preferred = ("random", None)
+        self._set_combo_items(controls["sort"], sort_items, sort_preferred)
+
+    def _on_database_view_changed(self, db_id: str, db: dict):
+        self._populate_database_options(db_id, db)
+        self._schedule_preview()
+
     def _update_database_tabs(self, data: dict):
         previous = self._database_options()
         self.db_tabs.clear()
@@ -746,43 +951,41 @@ class NotionPdfWindow(QMainWindow):
             db = block["_db"]
             title = block.get("child_database", {}).get("title") or db.get("name") or f"数据库 {index}"
             page = QWidget()
+            page.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             form = QFormLayout(page)
+            form.setContentsMargins(12, 8, 12, 0)
+            form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
             view_combo = QComboBox()
+            show_title = QCheckBox("显示数据库标题")
             views = db.get("_views", [])
             for view in views:
                 view_combo.addItem(f'{view.get("name", "未命名视图")} ({view.get("type", "table")})', view.get("id"))
             if not views:
                 view_combo.addItem("自动识别", None)
             group_combo = QComboBox()
-            group_combo.addItem("跟随视图", None)
-            group_combo.addItem("不分组", "")
-            for name, prop in db.get("properties", {}).items():
-                if prop.get("type") in ("select", "multi_select", "status", "people", "checkbox"):
-                    group_combo.addItem(name, name)
             fit_combo = QComboBox()
-            fit_combo.addItem("跟随视图", None)
-            fit_combo.addItem("完整显示（Contain）", True)
-            fit_combo.addItem("填充裁剪（Cover）", False)
             size_combo = QComboBox()
-            size_combo.addItem("跟随视图", None)
-            size_combo.addItem("小", "small")
-            size_combo.addItem("中", "medium")
-            size_combo.addItem("大", "large")
+            sort_combo = QComboBox()
+            for combo in (view_combo, group_combo, fit_combo, size_combo, sort_combo):
+                combo.setMinimumWidth(0)
+                combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             form.addRow("视图：", view_combo)
+            form.addRow("标题：", show_title)
             form.addRow("分组字段：", group_combo)
             form.addRow("媒体适配：", fit_combo)
             form.addRow("卡片尺寸：", size_combo)
-            controls = {"view": view_combo, "group": group_combo, "fit": fit_combo, "size": size_combo}
+            form.addRow("排序字段：", sort_combo)
+            controls = {"view": view_combo, "show_title": show_title, "group": group_combo, "fit": fit_combo, "size": size_combo, "sort": sort_combo}
             self.db_controls[db_id] = controls
             saved = previous.get(db_id, {})
-            if saved.get("view_id"):
-                view_combo.setCurrentIndex(max(0, view_combo.findData(saved["view_id"])))
-            if saved.get("group_by"):
-                group_combo.setCurrentIndex(max(0, group_combo.findData(saved["group_by"])))
-            if "gallery_fit" in saved:
-                fit_combo.setCurrentIndex(max(0, fit_combo.findData(saved.get("gallery_fit"))))
-            size_combo.setCurrentIndex(max(0, size_combo.findData(saved.get("gallery_size"))))
-            for widget in controls.values():
+            initial_view_id = saved.get("view_id") or db.get("_requested_view_id")
+            if initial_view_id:
+                view_combo.setCurrentIndex(max(0, view_combo.findData(initial_view_id)))
+            self._populate_database_options(db_id, db, saved)
+            view_combo.currentIndexChanged.connect(lambda _index, did=db_id, database=db: self._on_database_view_changed(did, database))
+            show_title.stateChanged.connect(lambda _state: self._schedule_preview())
+            for widget in (group_combo, fit_combo, size_combo, sort_combo):
                 widget.currentIndexChanged.connect(self._schedule_preview)
             self.db_tabs.addTab(page, str(title)[:24])
         tab_height = 46 + max(
@@ -796,9 +999,11 @@ class NotionPdfWindow(QMainWindow):
         for db_id, controls in self.db_controls.items():
             result[db_id] = {
                 "view_id": controls["view"].currentData(),
+                "show_title": controls["show_title"].isChecked(),
                 "group_by": controls["group"].currentData(),
                 "gallery_fit": controls["fit"].currentData(),
                 "gallery_size": controls["size"].currentData(),
+                "sort": controls["sort"].currentData(),
             }
         return result
 
@@ -895,12 +1100,30 @@ class NotionPdfWindow(QMainWindow):
             html_path.write_text(result["html"], encoding="utf-8")
             LOGGER.info("Wrote preview html to %s", html_path)
             self.preview.load(QUrl.fromLocalFile(str(html_path)))
+            self.preview.loadFinished.connect(self._apply_mask_visibility_once)
             self._set_status("预览已更新")
         except Exception as exc:
             LOGGER.exception("Failed to write/load preview html")
             self._set_status(f"预览错误：{exc}")
         if self._preview_pending:
             QTimer.singleShot(0, self._do_preview)
+
+    def _apply_mask_visibility_once(self, ok: bool):
+        try:
+            self.preview.loadFinished.disconnect(self._apply_mask_visibility_once)
+        except (RuntimeError, TypeError):
+            pass
+        if ok:
+            self._toggle_adaptive_masks(self._show_adaptive_masks, update_button=False)
+
+    def _toggle_adaptive_masks(self, checked: bool, update_button: bool = True):
+        self._show_adaptive_masks = checked
+        if update_button:
+            self.mask_btn.setIcon(self._outline_icon("eye-off.svg" if checked else "eye.svg"))
+            self.mask_btn.setToolTip("关闭主体识别辅助图层" if checked else "显示主体识别辅助图层")
+        self.preview.page().runJavaScript(
+            "document.body.classList.toggle('show-adaptive-mask', %s);" % ("true" if checked else "false")
+        )
 
     def _on_preview_error(self, message: str):
         self._preview_busy = False

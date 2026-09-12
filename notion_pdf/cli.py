@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="notion-pdf",
         description="Export a Notion page to a styled PDF.",
     )
-    parser.add_argument("url", help="Notion page URL or page id")
+    parser.add_argument("url", help="Notion page/database URL or id")
     parser.add_argument(
         "--token", "-t", required=True,
         help="Notion integration token. If the value is an existing file path (or prefixed with '@'), its contents are read and stripped."
@@ -121,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--database-media-fit", action="append", default=[], metavar="DATABASE_ID=MODE",
-        help="Set contain, cover, or follow for one database.",
+        help="Set contain, cover, auto (subject-aligned), or follow for one database.",
     )
     parser.add_argument(
         "--verbose",
@@ -157,7 +157,7 @@ def database_options_from_args(args) -> dict[str, dict]:
     _assign_database_options(options, args.database_gallery_size, "gallery_size", gallery_size)
     _assign_database_options(
         options, args.database_media_fit, "gallery_fit",
-        lambda value: None if value == "follow" else {"contain": True, "cover": False}[value],
+        lambda value: None if value == "follow" else {"contain": True, "cover": False, "auto": "auto"}[value],
     )
     return options
 
