@@ -26,3 +26,5 @@ venv/
 *.html
 output/
 .pytest_cache/
+
+.venv/

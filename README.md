@@ -2,6 +2,19 @@
 
 A Python tool that exports a Notion page or database to a styled PDF using the Notion API and a headless browser renderer. It includes both a command-line interface and a visual GUI with live A4 preview.
 
+## uv startup
+
+```bash
+uv run --locked notion-pdf-gui
+uv run --locked notion-pdf --help
+uv run --locked playwright install chromium
+uv run --locked --extra dev python -m pytest -q
+```
+
+Python 3.13.13 is selected by `.python-version`. The uv project preserves all dependencies
+from `requirements.txt`, including `rembg[cpu]`; no export or GUI behavior is changed.
+Chromium is needed for PDF export; the existing pip workflow remains supported.
+
 ## Features
 
 - Renders page properties as a compact info bar under the title.
