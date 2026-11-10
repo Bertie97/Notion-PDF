@@ -1,0 +1,5 @@
+name = "Notion to PDF 转换器"
+description = "预览 Notion 文档并导出 PDF 或 HTML。"
+category = "数据处理"
+command = ["uv","run","--locked","notion-pdf-gui"]
+readme = "README.md"
